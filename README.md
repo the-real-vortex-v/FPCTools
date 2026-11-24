@@ -151,6 +151,68 @@ With unit resolution, `-get-block all` can emit a monolithic compilable program:
 
 ---
 
+## AI agent workflow: with and without fpctools
+
+The following is the same real task — *fix a corrupted assignment inside a nested loop, in a unit that is included by a program, then verify* — done two ways.
+
+### Without fpctools (the fragile path)
+
+1. Search the source with `Select-String`/`grep` for `Total` → get a line number, e.g. `203`.
+2. Read a window of lines (`sed -n '185,220p'`) to figure out which `Total` is the bad one. Several assignment candidates exist; the agent guesses from context.
+3. Apply a patch by line number or raw text replacement. The text is one line of a file that may actually be an `{$I}` include — but the agent assumes the root file.
+4. The edit shifts every later line by ±N. The agent's next command still uses the old line number `211`, so it patches a different statement — silently corrupting a declaration or a `uses` clause.
+5. The compiler reports an error at line `212`. The agent re-greps, re-counts, edits again, shifts again.
+6. A multi-statement line (`Alpha := 1; Beta := 2;`) gets replaced wholesale, deleting the neighbour.
+7. Verification is an afterthought: the agent runs the compiler late, or trusts the edit tool's `Written:` output — which merely echoes the source and is not proof of a write.
+8. Large file windows are read repeatedly, consuming context and attention.
+
+Typical result: the agent spends most of its effort managing coordinates and re-reading source, and the failure mode is a *clean-looking but wrong* edit.
+
+### With fpctools (the same task)
+
+```sh
+# 1. Resolve the symbol to a semantic handle (no line numbers)
+fpctools -gsline main.pas          # scan the statement map for the Total assignment
+#   uc3archive.addfiles.for.2   GS137  L 203.1  ArchiveAddFiles -> for I := 1 to N  Total := Total + I;
+
+# 2. Preview exactly that statement
+fpctools -stmt-replace uc3archive.addfiles.for.2 'Total := Total + I + 1;' --diff --no-cache main.pas
+
+# 3. Apply with a parse-check; origin-aware write-back sends it to the real file
+fpctools -stmt-replace uc3archive.addfiles.for.2 'Total := Total + I + 1;' --verify --no-cache main.pas
+#   Verify OK: resulting source is clean
+#   Written: F:\Code\Vibe\Uc2_source\fpc\uc3archive.pas     <- the include/unit, not main.pas
+
+# 4. Convert a compiler diagnostic line back to a handle if needed
+fpctools -gline-to-gsline 212 main.pas
+#   uc3archive.addfiles.if.1   GS141  L 212.1  ...
+
+# 5. Re-query the same path after the edit — the path still resolves; the line did not
+fpctools -gsline uc3archive.addfiles.for.2 --no-cache main.pas
+
+# 6. Gate the result
+fpctools -check --strict --clear-cache --no-cache main.pas
+fpc -B -Mobjfpc -Sh main.pas
+```
+
+For a partial-line change, use `-replace-fragment` instead; for a whole line, `-edit-block ... --match ... --with ...`.
+
+### Why this is more practical
+
+| Concern | Without fpctools | With fpctools |
+|---|---|---|
+| Target identity | Line number that shifts after every write | Semantic path (`uc3archive.addfiles.for.2`) that still resolves |
+| Multiple statements on one line | Whole line replaced, neighbours lost | Statement/fragment span only; separators preserved |
+| Includes and units | Edit applied to the wrong file | Origin-aware write-back to the owning file |
+| Verification | Late compiler run, or trust in `Written:` | `--diff` preview and `--verify` parse-check before write |
+| Compiler diagnostics | Agent re-greps and re-counts | `-gline-to-gsline` converts a line to a handle |
+| Context cost | Repeated file windows and re-reads | One map row, one diff, one report section |
+| Failure mode | Clean-looking but wrong edit | Explicit bitmask/verify failure, re-inspect the block |
+
+The deeper benefit is **clarified agent work**: the agent reasons about *routines, blocks and statements* rather than coordinates. The mandatory `AGENTS.md` rule below removes the tempting fallback ("just grep for the line") and gives one predictable decision chain: locate semantically → choose the edit by scope → preview → verify → gate. That turns editing from a coordinate-management problem into a small, auditable sequence.
+
+---
+
 ## Editing without line numbers (the important part)
 
 Resolve a semantic handle first, then pick the edit command by scope:
@@ -263,7 +325,7 @@ When editing fpctools itself:
 
 ---
 
-## Known limitations/Still to do
+## Known limitations / Still to do
 
 - `{$IFDEF}` branches are evaluated for activity marking, but code is never filtered out of navigation — both branches remain addressable.
 - The statement collector is heuristic, though it handles generics, attributes, class `var` sections, `begin..end` and single-statement branch bodies, `try`/`case` bodies, and calling conventions.
